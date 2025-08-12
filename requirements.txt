@@ -23,7 +23,7 @@ APScheduler==3.10.4
 python-dotenv==1.0.1
 
 # Uploads (patched)
-python-multipart==0.0.9
+python-multipart==0.0.18
 
 # QR/Images
 qrcode==7.4.2
