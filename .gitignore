@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.cover
+*.pyc
+*.log
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage*
+
+# Envs
+.venv/
+venv/
+env/
+
+# Node (если есть фронт)
+node_modules/
+dist/
+build/
+
+# IDE/OS
+.idea/
+.vscode/
+.DS_Store
+
+# Data/artefacts
+*.sqlite
+*.db
+*.zip
+*.tar.gz
+*.pem
+*.crt
+*.key
+*.env
+.env.*
+!.env.example
+
+# Docker
+*.pid
+docker_logs/*

@@ -1,0 +1,47 @@
+services:
+  cryptoluck-bot:
+    build: .
+    ports:
+      - "${HOST_PORT:-8080}:8000" # host:container; uvicorn listens on 8000 in the container
+    environment:
+      DATABASE_URL: "${DATABASE_URL:?set in .env}"
+      DEV_MODE: "${DEV_MODE:-false}"
+    volumes:
+      - ./assets:/app/assets
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - cryptoluck-network
+    # Prefer using the image's own HEALTHCHECK (already defined in Dockerfile).
+    # If you want to override it here instead, ensure the command exists in the image.
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:?set in .env}"
+      POSTGRES_USER: "${POSTGRES_USER:?set in .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set in .env}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Expose to host only if you need local psql access. Keep internal by default.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    restart: unless-stopped
+    networks:
+      - cryptoluck-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  postgres_data:
+
+networks:
+  cryptoluck-network:
+    driver: bridge

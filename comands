@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# CryptoLuck Bot — production command helper
+# Usage examples:
+#   bash comands install
+#   bash comands fix_deps      # fix dependency versions and compose 'version' key
+#   bash comands start         # foreground
+#   bash comands start_bg      # background via nohup
+#   bash comands stop          # stop background process
+#   bash comands health        # check health endpoint
+#   bash comands status        # detailed status endpoint
+#   bash comands docker_up     # run with Docker
+#   bash comands docker_down
+#
+# IMPORTANT: set your environment before start (see the ENV section below).
+
+set -euo pipefail
+
+# ===================== ENV (edit and source in your shell or export before start) =====================
+# Required
+: "${API_TOKEN:=}"                         # Telegram bot token
+: "${NOWPAYMENTS_API_KEY:=}"               # NOWPayments API key
+: "${NOWPAYMENTS_IPN_SECRET:=}"            # NOWPayments IPN HMAC secret
+: "${IPN_CALLBACK_URL:=}"                  # Public https URL for IPN, e.g. https://your.host/payments/ipn
+
+# Recommended defaults for production
+export DEV_MODE=${DEV_MODE:-false}         # must be false to enable polling bot and scheduler
+export TIMEZONE=${TIMEZONE:-America/Caracas}
+export DRAW_CRON_DAY_OF_WEEK=${DRAW_CRON_DAY_OF_WEEK:-thu}
+export DRAW_CRON_HOUR=${DRAW_CRON_HOUR:-20}
+export DRAW_CRON_MINUTE=${DRAW_CRON_MINUTE:-0}
+
+# Payouts (NOWPayments custody by default)
+export PAYOUT_METHOD=${PAYOUT_METHOD:-nowpayments}   # nowpayments | self_wallet
+export PRIZE_PAYOUT_CURRENCY=${PRIZE_PAYOUT_CURRENCY:-USDTTRC20}
+export OWNER_PAYOUT_CURRENCY=${OWNER_PAYOUT_CURRENCY:-USDTTRC20}
+export OWNER_WALLETS=${OWNER_WALLETS:-}              # CSV list, e.g. "Txxxx, Tyyyy"
+
+# Tickets and thresholds
+export TICKET_PRICE_USD=${TICKET_PRICE_USD:-0.10}
+export PRIZE_USD=${PRIZE_USD:-10.0}
+# For testing a single $11 payment -> 110 tickets:
+# export MIN_TICKETS_PER_PAYMENT=110
+
+# Database
+# Dev (SQLite):
+export DB_URL=${DB_URL:-sqlite+aiosqlite:///./data/app.sqlite}
+# For Postgres in prod:
+# export DB_URL=postgresql+asyncpg://user:password@host:5432/dbname
+
+# Network
+export HOST=${HOST:-0.0.0.0}
+export PORT=${PORT:-8080}
+
+# Paths
+VENV_DIR="${VENV_DIR:-.venv}"
+PID_FILE="${PID_FILE:-app.pid}"
+LOG_FILE="${LOG_FILE:-cryptoluck.log}"
+
+need_env() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "ERROR: Required env var $name is not set." >&2
+    exit 1
+  fi
+}
+
+ensure_env_required() {
+  need_env API_TOKEN
+  need_env NOWPAYMENTS_API_KEY
+  need_env NOWPAYMENTS_IPN_SECRET
+  need_env IPN_CALLBACK_URL
+}
+
+ensure_venv() {
+  if [ ! -d "$VENV_DIR" ]; then
+    python -m virtualenv "$VENV_DIR"
+  fi
+  # shellcheck disable=SC1090
+  source "$VENV_DIR/bin/activate"
+}
+
+cmd_install() {
+  mkdir -p data
+  ensure_venv
+  pip install --upgrade pip wheel
+  pip install -r requirements.txt
+  echo "OK: Dependencies installed."
+}
+
+cmd_fix_deps() {
+  # Align dependencies to satisfy aiogram 3.4.1 requirements and cleanup compose version attribute
+  if [ -f requirements.txt ]; then
+    sed -i 's/^fastapi==.*/fastapi==0.108.0/' requirements.txt || true
+    sed -i 's/^pydantic==.*/pydantic==2.5.3/' requirements.txt || true
+    echo "OK: requirements.txt updated (fastapi==0.108.0, pydantic==2.5.3)."
+  else
+    echo "WARN: requirements.txt not found."
+  fi
+  if [ -f docker-compose.yml ]; then
+    # remove any top-level version: line to suppress compose warning
+    sed -i '/^version:/d' docker-compose.yml || true
+    echo "OK: docker-compose.yml cleaned (removed version:)."
+  fi
+  echo "Next steps:"
+  echo "  docker compose build --no-cache"
+  echo "  docker compose up -d"
+}
+
+cmd_start() {
+  ensure_env_required
+  ensure_venv
+  echo "Starting CryptoLuck in foreground on ${HOST}:${PORT} ..."
+  # Keep workers=1 to avoid multiple schedulers/bots
+  exec uvicorn main:app --host "${HOST}" --port "${PORT}" --workers 1 --proxy-headers
+}
+
+cmd_start_bg() {
+  ensure_env_required
+  ensure_venv
+  echo "Starting CryptoLuck in background on ${HOST}:${PORT} ..."
+  # shellcheck disable=SC2091
+  nohup bash -lc "uvicorn main:app --host '${HOST}' --port '${PORT}' --workers 1 --proxy-headers" \
+    >"${LOG_FILE}" 2>&1 &
+  echo $! > "${PID_FILE}"
+  echo "OK: PID $(cat "${PID_FILE}"), logs: ${LOG_FILE}"
+}
+
+cmd_stop() {
+  if [ -f "${PID_FILE}" ]; then
+    PID="$(cat "${PID_FILE}")"
+    if ps -p "${PID}" > /dev/null 2>&1; then
+      kill "${PID}" || true
+      echo "Stopped PID ${PID}"
+    fi
+    rm -f "${PID_FILE}"
+  else
+    echo "No PID file found (${PID_FILE}). If running under Docker/systemd, stop that service."
+  fi
+}
+
+cmd_health() {
+  curl -sf "http://127.0.0.1:${PORT}/health" | jq . || curl -sf "http://127.0.0.1:${PORT}/health" || true
+}
+
+cmd_status() {
+  curl -sf "http://127.0.0.1:${PORT}/status" | jq . || curl -sf "http://127.0.0.1:${PORT}/status" || true
+}
+
+cmd_logs() {
+  if [ -f "${LOG_FILE}" ]; then
+    tail -n 200 -f "${LOG_FILE}"
+  else
+    echo "Log file ${LOG_FILE} not found. If running foreground, logs are on stdout."
+  fi
+}
+
+cmd_docker_up() {
+  # Build and run with Docker; expects a valid .env file for environment
+  docker build -t cryptoluck:prod .
+  docker rm -f cryptoluck >/dev/null 2>&1 || true
+  docker run -d --name cryptoluck \
+    --env-file .env \
+    -p "${PORT}:8080" \
+    cryptoluck:prod
+  echo "Docker container 'cryptoluck' started on port ${PORT}."
+}
+
+cmd_docker_down() {
+  docker rm -f cryptoluck || true
+  echo "Docker container 'cryptoluck' removed."
+}
+
+case "${1:-}" in
+  install)      cmd_install ;;
+  fix_deps)     cmd_fix_deps ;;
+  start)        cmd_start ;;
+  start_bg)     cmd_start_bg ;;
+  stop)         cmd_stop ;;
+  health)       cmd_health ;;
+  status)       cmd_status ;;
+  logs)         cmd_logs ;;
+  docker_up)    cmd_docker_up ;;
+  docker_down)  cmd_docker_down ;;
+  *)
+    cat <<'USAGE'
+Usage: bash comands <command>
+
+Commands:
+  install       Create venv and install dependencies
+  fix_deps      Fix dependency versions and remove compose 'version:' key, then rebuild with Docker
+  start         Start app in foreground (production, workers=1)
+  start_bg      Start app in background (nohup, logs to cryptoluck.log)
+  stop          Stop background app (by PID file)
+  health        Check /health endpoint
+  status        Check /status endpoint
+  logs          Tail background log file
+  docker_up     Build and run as Docker container (expects .env)
+  docker_down   Stop/remove Docker container
+
+Before start, export required environment variables:
+  export API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  export NOWPAYMENTS_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxx
+  export NOWPAYMENTS_IPN_SECRET=xxxxxxxxxxxxxxxxxxxxxxxx
+  export IPN_CALLBACK_URL=https://your.host/payments/ipn
+  export DEV_MODE=false
+  export TIMEZONE=America/Caracas
+  export DRAW_CRON_DAY_OF_WEEK=thu
+  export DRAW_CRON_HOUR=20
+  export DRAW_CRON_MINUTE=0
+  # Optional payouts:
+  export PAYOUT_METHOD=nowpayments
+  export PRIZE_PAYOUT_CURRENCY=USDTTRC20
+  export OWNER_WALLETS="Txxxx,Tyyyy"
+
+Docker rebuild after dependency fix:
+  docker compose build --no-cache && docker compose up -d
+USAGE
+    ;;
+esac
+
+
+
+
+## 1) Docker: сборка/запуск/остановка
+
+```bash
+# Полная пересборка образа приложения (без кеша)
+docker compose build --no-cache
+
+# Запуск в фоне
+docker compose up -d
+
+# Просмотр логов приложения (бота)
+docker compose logs -f bot
+
+# Остановка контейнеров
+docker compose down
+
+# Полный сброс (удалит БД/volume!)
+docker compose down -v
+
+# Перезапуск только сервиса bot
+docker compose restart bot
+
+# Выполнить команду в контейнере бота
+docker compose exec bot bash
+```
+
+## 2) Миграции Alembic
+
+```bash
+# Применить все миграции (обычно делается автоматически при старте)
+docker compose exec bot alembic upgrade head
+
+# Создать новую миграцию (при изменении моделей) — пример
+docker compose exec bot alembic revision -m "your message"
+
+# Откатить на один шаг
+docker compose exec bot alembic downgrade -1
+
+# Проверить структуру таблицы payments (уникальный индекс на external_payment_id)
+docker compose exec db psql -U postgres -d cryptoluck -c "\d+ payments"
+```
+
+## 3) Healthcheck и базовая проверка HTTP
+
+```bash
+# Проверка health эндпоинта
+curl -s http://localhost:8000/health
+# Ожидается: {"ok": true}
+```
+
+## 4) Смок‑тест IPN (эмуляция отправки от NOWPayments)
+
+Создайте тестовое тело запроса и посчитайте подпись HMAC‑SHA512.
+
+```bash
+# Подготовим JSON (замените order_id на свой Telegram user_id)
+cat > /tmp/ipn.json <<'JSON'
+{
+  "payment_id": "test-12345",
+  "order_id": "123456789",
+  "payment_status": "confirmed",
+  "pay_amount": "1.00",
+  "pay_currency": "USDTTRC20",
+  "price_amount": "0.10",
+  "price_currency": "usd"
+}
+JSON
+
+# Посчитаем подпись (использует NOWPAYMENTS_IPN_SECRET из вашей .env)
+python - <<'PY'
+import hmac, hashlib, os
+secret = os.environ.get("NOWPAYMENTS_IPN_SECRET","" ).encode()
+body = open("/tmp/ipn.json","rb").read()
+print(hmac.new(secret, body, hashlib.sha512).hexdigest())
+PY
+
+# Отправим IPN с подписью (подставьте SIG из вывода предыдущей команды)
+SIG=<ВСТАВЬТЕ_ПОДПИСЬ_ОТСЮДА>
+curl -i \
+  -H "Content-Type: application/json" \
+  -H "x-nowpayments-sig: $SIG" \
+  --data-binary @/tmp/ipn.json \
+  http://localhost:8000/ipn/nowpayments
+```
+
+Проверьте логи:
+
+```bash
+docker compose logs -f bot | grep "IPN:"
+```
+
+Повторите тот же запрос ещё раз (дубликат) — билеты не должны начисляться повторно (идемпотентность), в логах будет duplicate/skip.
+
+## 5) Команды для просмотра билетов/БД
+
+```bash
+# /tickets — в Телеграм: отправьте боту команду, покажет только активный раунд
+
+# Прямой SQL: сумма билетов в активном раунде
+docker compose exec db psql -U postgres -d cryptoluck -c \
+"SELECT r.id AS round_id, COALESCE(SUM(e.tickets),0) AS total_tickets
+   FROM lottery_rounds r
+   LEFT JOIN entries e ON e.round_id = r.id
+  WHERE r.status='active'
+  GROUP BY r.id
+  ORDER BY r.id DESC LIMIT 1;"
+```
+
+## 6) Логи
+
+```bash
+# Все логи бота
+docker compose logs -f bot
+
+# Только строки IPN
+docker compose logs -f bot | grep "IPN:"
+
+# Логи базы (опционально)
+docker compose logs -f db
+```
+
+## 7) Локальные линтеры/тесты (опционально)
+
+```bash
+# В контейнере
+docker compose exec bot flake8 app
+docker compose exec bot pytest -q
+
+# На хосте (Python 3.11)
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install alembic pytest flake8
+flake8 app
+pytest -q
+```
+
+## 8) Git — типовые команды
+
+```bash
+# Инициализация репозитория (если нужно)
+git init
+
+git status
+
+git add -A
+
+git commit -m "feat: production-ready lottery with NOWPayments invoices and IPN idempotency"
+
+# Подключить удалённый репозиторий
+git remote add origin <GIT_URL>
+
+# Пуш в основную ветку (создаст ветку на удалённом)
+git push -u origin main
+
+# Получить изменения из удалённого
+git pull --rebase origin main
+
+# Новая ветка для фичи
+git checkout -b feature/payments-invoice
+
+# Теги (релиз)
+git tag -a v1.0.0 -m "Production initial"
+git push origin v1.0.0
+
+# Сохранить локальные изменения временно
+git stash
+# Восстановить
+git stash pop
+```
+
+## 9) Быстрые подсказки
+
+- Если меняли зависимости (requirements.txt) — делайте пересборку образа: `docker compose build --no-cache && docker compose up -d`.
+- Миграции применяются автоматически на старте, но можно прогнать вручную: `docker compose exec bot alembic upgrade head`.
+- Если health не зелёный — смотрите логи `bot` и `db`.
+
+
+cloudflared tunnel --url http://localhost:8080
+
